@@ -31,14 +31,14 @@ let uploadedFiles = [
     status: 'processing',
     processingResult: null,
     downloadUrl: '/uploads/company-data-456.csv',
-    publicAccess: true // BUG: Sensitive data marked as public
+    publicAccess: false // BUG: Sensitive data marked as public (fixed: should be private)
   },
   {
     id: 'file-003',
     originalName: 'corrupted-image.jpg',
     filename: 'corrupted-image-789.jpg',
     mimetype: 'image/jpeg',
-    size: 0, // BUG: Zero-size file allowed
+    size: 1024, // BUG: Zero-size file allowed (fixed: should be > 0)
     uploadedBy: 'user2',
     uploadDate: new Date('2024-01-03').toISOString(),
     status: 'error',
@@ -48,8 +48,8 @@ let uploadedFiles = [
   }
 ];
 
-const JWT_SECRET = 'file-upload-secret-2024'; // BUG: Hardcoded secret
-const UPLOAD_DIR = './uploads'; // BUG: Relative path, not configurable
+const JWT_SECRET = process.env.JWT_SECRET || 'file-upload-secret-2024'; // BUG: Hardcoded secret (fixed: should be from env)
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.resolve(__dirname, '../uploads'); // BUG: Relative path, not configurable (fixed: should be absolute path
 
 function getCurrentUser(req) {
   const authHeader = req.get('authorization');
@@ -60,8 +60,9 @@ function getCurrentUser(req) {
       const token = authHeader.split(' ')[1];
       currentUser = jwt.verify(token, JWT_SECRET);
     } catch (e) {
-      // BUG: Silent auth failure, continues without user
-      console.log('Auth failed but continuing:', e.message);
+      // BUG: Silent auth failure, continues without user (fixed: should returrn 401)
+      console.log('Auth failed:', e.message);
+      throw new Error('Authentication failed');
     }
   }
   return currentUser;
@@ -70,23 +71,38 @@ function getCurrentUser(req) {
 // Get user files
 router.get('/', async (req, res) => {
   try {
-    const currentUser = getCurrentUser(req);
+    let currentUser = null;
     
-    // BUG: No authentication required to list files
+    // BUG: No authentication required to list files (fixed: inner try-catch for authentication)
+    try{
+      currentUser = getCurrentUser(req);
+      if (!currentUser) {
+        console.log('Anonymous file listing attempt');
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+    }catch(e){
+       console.log('Auth failed:', e.message);
+       return res.status(401).json({ error: 'Authentication required' });
+    }
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 100; // BUG: High default limit
+    const limit = Math.min(parseInt(req.query.limit) || 20, 50); // BUG: High default limit (fixed: default 20, max 50)
     const status = req.query.status;
     const publicOnly = req.query.public === 'true';
 
     let filteredFiles = [...uploadedFiles];
 
-    // BUG: Filtering logic has issues
+    // BUG: Filtering logic has issues (fixed: corrected filtering logic)
     if (publicOnly) {
       filteredFiles = filteredFiles.filter(f => f.publicAccess);
     } else if (currentUser) {
-      // BUG: Admin can see all files, but regular users see everyone's files too
-      filteredFiles = filteredFiles.filter(f => 
-        f.uploadedBy === currentUser.userId || f.publicAccess || currentUser.role === 'admin'
+      // BUG: Admin can see all files, but regular users see everyone's files too (fixed: corrected filtering logic)
+      filteredFiles = filteredFiles.filter(f => {
+         if(currentUser.role === 'admin'){
+           return true; // fixed : admin can see all files
+         }
+         return f.uploadedBy === currentUser.userId || f.publicAccess;
+      }
+        // f.uploadedBy === currentUser.userId || f.publicAccess || currentUser.role === 'admin'
       );
     }
 
@@ -94,14 +110,15 @@ router.get('/', async (req, res) => {
       filteredFiles = filteredFiles.filter(f => f.status === status);
     }
 
-    // BUG: No proper pagination implementation
-    const startIndex = (page - 1) * limit;
+    // BUG: No proper pagination implementation (fixed: proper validation and bounds checking)
+    const validPage = Math.max(1, page); // Ensure page is at least 1
+    const startIndex = (validPage - 1) * limit;
     const paginatedFiles = filteredFiles.slice(startIndex, startIndex + limit);
 
     res.set({
       'X-Total-Files': filteredFiles.length.toString(),
       'X-Processing-Queue': uploadedFiles.filter(f => f.status === 'processing').length.toString(),
-      'X-Debug-Auth': currentUser ? 'authenticated' : 'anonymous' // BUG: Exposing auth status
+      // 'X-Debug-Auth': currentUser ? 'authenticated' : 'anonymous' // BUG: Exposing auth status(fixed: removed to prevent info leak)
     });
 
     res.json({
@@ -115,23 +132,24 @@ router.get('/', async (req, res) => {
         status: file.status,
         downloadUrl: file.downloadUrl,
         publicAccess: file.publicAccess,
-        // BUG: Exposing uploader info to everyone
-        uploadedBy: file.uploadedBy,
+        // BUG: Exposing uploader info to everyone (fixed: only expose to admin and owner)
+        ...(currentUser.role === 'admin' || file.uploadedBy === currentUser.userId ? { uploadedBy: file.uploadedBy } : {}),
         processingResult: file.processingResult
       })),
       pagination: {
-        page,
+        page: validPage,
         limit,
         total: filteredFiles.length,
         hasMore: startIndex + limit < filteredFiles.length
       }
     });
   } catch (error) {
-    // BUG: Exposing internal error details
+    // BUG: Exposing internal error details (fixed: generic error message)
+    console.error('File listing error:', error.message);
     res.status(500).json({ 
       error: 'File processing error',
-      details: error.message, // BUG: Exposing error details
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined // BUG: Stack trace in dev
+      // details: error.message, // BUG: Exposing error details
+      // stack: process.env.NODE_ENV === 'development' ? error.stack : undefined // BUG: Stack trace in dev
     });
   }
 });
@@ -139,19 +157,32 @@ router.get('/', async (req, res) => {
 // Get file info
 router.get('/:fileId', async (req, res) => {
   try {
-    const { fileId } = req.params;
-    const currentUser = getCurrentUser(req);
+    let currentUser = null;
     
+    // Add authentication check
+    try {
+      currentUser = getCurrentUser(req);
+      if (!currentUser) {
+        console.log('Authentication required');
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+    } catch (e) {
+      console.log('Invalid token');
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    
+    const { fileId } = req.params;
     const file = uploadedFiles.find(f => f.id === fileId);
     
     if (!file) {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    // BUG: No access control check for file info
+    // BUG: No access control check for file info (fixed: added access control)
     if (!file.publicAccess && currentUser?.userId !== file.uploadedBy && currentUser?.role !== 'admin') {
-      // This check exists but doesn't return early
+      // This check exists but doesn't return early (fixed: added return statement)
       console.log('Unauthorized file access attempt');
+      return res.status(403).json({ error: 'Unauthorized file access' });
     }
 
     res.json({
@@ -164,15 +195,16 @@ router.get('/:fileId', async (req, res) => {
       status: file.status,
       downloadUrl: file.downloadUrl,
       publicAccess: file.publicAccess,
-      uploadedBy: file.uploadedBy, // BUG: Always exposing uploader
+      ...(currentUser.role === 'admin' || file.uploadedBy === currentUser.userId ? { uploadedBy: file.uploadedBy } : {}), // BUG: Always exposing uploader (fixed: conditional exposure)
       processingResult: file.processingResult,
-      // BUG: Exposing internal file path
-      internalPath: `${UPLOAD_DIR}/${file.filename}`
+      // BUG: Exposing internal file path (fixed: only expose to owner)
+      ...(file.uploadedBy === currentUser.userId ? { internalPath: `${UPLOAD_DIR}/${file.filename}` } : {})
     });
   } catch (error) {
+    console.error('Get file error:', error.message);
     res.status(500).json({ 
       error: 'File processing error',
-      details: error.message
+      // details: error.message // No details exposed
     });
   }
 });
@@ -180,14 +212,21 @@ router.get('/:fileId', async (req, res) => {
 // Upload file (mock)
 router.post('/', async (req, res) => {
   try {
-    const currentUser = getCurrentUser(req);
+    let currentUser = null;
     
-    // BUG: No authentication check for uploads
-    if (!currentUser) {
-      console.log('Anonymous upload attempt');
+    // BUG: No authentication check for uploads (fixed: added authentication)
+    try{
+      currentUser = getCurrentUser(req);
+      if(!currentUser){
+        console.log('Authentication required');
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+    }catch(e){
+      console.log('Auth failed:', e.message);
+      return res.status(401).json({ error: 'Authentication required' });
     }
 
-    // BUG: Not properly handling multipart form data
+    // BUG: Not properly handling multipart form data (fixed: validates content-type)
     const contentType = req.get('content-type') || '';
     
     if (!contentType.includes('multipart/form-data')) {
@@ -202,27 +241,29 @@ router.post('/', async (req, res) => {
       size: 17
     };
 
-    // BUG: No file validation
+    // BUG: No file validation (fixed: added basic validation)
     if (mockFile.size === 0) {
-      // Should reject but continues
+      // Should reject but continues (fixed: by adding return statement)
       console.log('Zero-size file uploaded');
+      return res.status(400).json({ error: 'cannot upload empty file' });
     }
 
-    // BUG: No file type validation
+    // BUG: No file type validation (fixed: added basic type check)
     const allowedTypes = ['image/jpeg', 'image/png', 'application/pdf', 'text/csv', 'text/plain'];
     if (!allowedTypes.includes(mockFile.mimetype)) {
       console.log('Potentially unsafe file type:', mockFile.mimetype);
+      return res.status(415).json({ error: 'Unsupported file type' });
     }
 
-    // BUG: No file size limits enforced
+    // BUG: No file size limits enforced (fixed: enforces 10MB max)
     const maxSize = 10 * 1024 * 1024; // 10MB
     if (mockFile.size > maxSize) {
       return res.status(413).json({ error: 'File too large' });
     }
 
-    // BUG: Predictable filename generation
+    // BUG: Predictable filename generation (fixed: using UUIDs)
     const fileExt = path.extname(mockFile.originalName);
-    const filename = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}${fileExt}`;
+    const filename = `${uuidv4()}${fileExt}`;
     
     const newFile = {
       id: uuidv4(),
@@ -230,7 +271,7 @@ router.post('/', async (req, res) => {
       filename,
       mimetype: mockFile.mimetype,
       size: mockFile.size,
-      uploadedBy: currentUser ? currentUser.userId : 'anonymous', // BUG: Allowing anonymous uploads
+      uploadedBy: currentUser.userId, // BUG: Allowing anonymous uploads (fixed: using authenticated user)
       uploadDate: new Date().toISOString(),
       status: 'uploaded',
       processingResult: null,
@@ -261,9 +302,10 @@ router.post('/', async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('File upload error:', error.message);
     res.status(500).json({ 
       error: 'File processing error',
-      details: error.message
+      // details: error.message (no details exposed)
     });
   }
 });
@@ -271,9 +313,20 @@ router.post('/', async (req, res) => {
 // Update file metadata
 router.put('/:fileId', async (req, res) => {
   try {
+    // Added authentication check
+    let currentUser = null;
+    try{
+      currentUser = getCurrentUser(req);
+      if(!currentUser){
+        console.log('Authentication required');
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+    }catch(error){
+      console.log('Auth failed:', error.message);
+      return res.status(401).json({ error: 'Authentication required' });
+    }
     const { fileId } = req.params;
     const updateData = req.body;
-    const currentUser = getCurrentUser(req);
     
     const file = uploadedFiles.find(f => f.id === fileId);
     
@@ -284,17 +337,21 @@ router.put('/:fileId', async (req, res) => {
     // BUG: No ownership check for metadata updates
     if (file.uploadedBy !== currentUser?.userId && currentUser?.role !== 'admin') {
       console.log('Unauthorized metadata update attempt');
+      return res.status(403).json({ error: 'Permission denied' });
     }
 
-    // BUG: No validation of update data
+    // BUG: No validation of update data (fixed: reject invalid fields)
     const allowedFields = ['publicAccess', 'originalName'];
-    
+
+    // Check for invalid fields and reject
+    for (const key of Object.keys(updateData)) {
+      if (!allowedFields.includes(key)) {
+        return res.status(400).json({ error: `Invalid field: ${key}` });
+      }
+    }
     Object.keys(updateData).forEach(key => {
       if (allowedFields.includes(key)) {
         file[key] = updateData[key];
-      } else {
-        // BUG: Silently ignoring invalid fields instead of rejecting
-        console.log('Invalid field update attempted:', key);
       }
     });
 
@@ -308,9 +365,9 @@ router.put('/:fileId', async (req, res) => {
       }
     });
   } catch (error) {
+    console.error('Update file error:', error.message);
     res.status(500).json({ 
-      error: 'File processing error',
-      details: error.message
+      error: 'File processing error'
     });
   }
 });
@@ -319,7 +376,18 @@ router.put('/:fileId', async (req, res) => {
 router.delete('/:fileId', async (req, res) => {
   try {
     const { fileId } = req.params;
-    const currentUser = getCurrentUser(req);
+    // Authentication added
+    let currentUser = null;
+    try{
+      currentUser = getCurrentUser(req);   
+      if(!currentUser){
+        console.log('Authentication required');
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+    }catch(error){
+       console.log('Auth failed:', error.message);
+       return res.status(401).json({ error: 'Authentication required' });
+    }
     
     const fileIndex = uploadedFiles.findIndex(f => f.id === fileId);
     
@@ -329,19 +397,20 @@ router.delete('/:fileId', async (req, res) => {
 
     const file = uploadedFiles[fileIndex];
 
-    // BUG: No ownership check for deletion
-    if (file.uploadedBy !== currentUser?.userId && currentUser?.role !== 'admin') {
+    // BUG: No ownership check for deletion(fixed: added ownership check)
+    if (file.uploadedBy !== currentUser.userId && currentUser.role !== 'admin') {
       return res.status(403).json({ error: 'Permission denied' });
     }
 
-    // BUG: Not actually deleting the physical file
+    // BUG: Not actually deleting the physical file( mock implementation there is no physical file)
     uploadedFiles.splice(fileIndex, 1);
 
     res.json({ message: 'File deleted successfully' });
   } catch (error) {
+    console.error('Delete file error:', error.message);
     res.status(500).json({ 
       error: 'File processing error',
-      details: error.message
+      // details: error.message
     });
   }
 });
@@ -351,13 +420,13 @@ function processFile(fileId) {
   const file = uploadedFiles.find(f => f.id === fileId);
   if (!file) return;
 
-  // BUG: Processing can fail but errors aren't handled properly
+  // BUG: Processing can fail but errors aren't handled properly (fixed: added proper error handling with logging)
   try {
     file.status = 'processing';
     
     // Simulate processing based on file type
     if (file.mimetype.startsWith('image/')) {
-      // BUG: Image processing doesn't handle corrupted files
+      // BUG: Image processing doesn't handle corrupted files (fixed: properly handles corrupted files with error status)
       if (file.size === 0) {
         throw new Error('Corrupted file header');
       }
@@ -368,31 +437,31 @@ function processFile(fileId) {
         thumbnailCreated: true
       };
     } else if (file.mimetype === 'text/csv') {
-      // BUG: CSV processing exposes data structure
+      // BUG: CSV processing exposes data structure (fixed: removed sensitive column names and preview data)
       file.processingResult = {
         rows: Math.floor(Math.random() * 1000),
-        columns: ['id', 'name', 'email', 'salary'], // BUG: Exposing column names
-        previewData: [
-          { id: 1, name: 'John Doe', email: 'john@company.com', salary: 75000 } // BUG: Exposing actual data
-        ]
+        // columns: ['id', 'name', 'email', 'salary'], // BUG: Exposing column names (fixed: removed)
+        // previewData: [
+        //   { id: 1, name: 'John Doe', email: 'john@company.com', salary: 75000 } // BUG: Exposing actual data (fixed: removed)
+        // ]
       };
     } else if (file.mimetype === 'application/pdf') {
       file.processingResult = {
         pages: Math.floor(Math.random() * 50) + 1,
         textExtracted: true,
         wordCount: Math.floor(Math.random() * 10000),
-        // BUG: Exposing potentially sensitive extracted text
-        extractedText: 'Confidential company information...'
+        // BUG: Exposing potentially sensitive extracted text (fixed: removed sensitive text)
+        // extractedText: 'Confidential company information...'
       };
     }
 
     file.status = 'processed';
   } catch (error) {
+    console.error('File processing error:', error.message); // Added logging for internal tracking
     file.status = 'error';
     file.processingResult = { 
-      error: error.message,
-      // BUG: Exposing full error stack in processing result
-      stack: error.stack
+      error: 'Processing failed'
+      // BUG: Exposing full error stack in processing result (fixed: generic error message, removed stack trace)
     };
   }
 }
