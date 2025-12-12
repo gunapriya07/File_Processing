@@ -4,6 +4,12 @@ const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
 const fsPromises = fs.promises;
+// Added: Real upload handling with multer (replaces mock upload)
+// Why: README requires actual file storage and multipart handling
+const multer = require('multer');
+const { scanFile } = require('../middleware/virusScanner');
+const { validateByContent } = require('../middleware/validator');
+const { generateThumbnail } = require('../utils/thumbnails');
 
 const router = express.Router();
 
@@ -51,13 +57,55 @@ let uploadedFiles = [
 ];
 
 const JWT_SECRET = process.env.JWT_SECRET || 'file-upload-secret-2024'; // BUG: Hardcoded secret (fixed: should be from env)
-const UPLOAD_DIR = process.env.UPLOAD_DIR || path.resolve(__dirname, '../uploads'); // BUG: Relative path, not configurable (fixed: should be absolute path
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.resolve(__dirname, '../uploads'); // Changed: ensure absolute path; reads from env if provided
 
 // Initialize uploads directory
 if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   console.log(`Created uploads directory at: ${UPLOAD_DIR}`);
 }
+
+// Added: Multer storage configuration for real file uploads
+// Why: Replace previous mock upload with secure, size-limited uploads
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, UPLOAD_DIR);
+  },
+  filename: function (req, file, cb) {
+    const ext = path.extname(file.originalname);
+    cb(null, `${uuidv4()}${ext}`);
+  }
+});
+
+// Changed: Broaden CSV MIME types to handle varied client headers
+// Why: Different shells/tools may send CSV as application/vnd.ms-excel or text/plain
+const allowedTypes = [
+  'image/jpeg',
+  'image/png',
+  'application/pdf',
+  'text/csv',
+  'text/plain',
+  'application/csv',
+  'text/x-csv',
+  'application/vnd.ms-excel'
+];
+
+const uploadMulter = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB as per README
+  fileFilter: (req, file, cb) => {
+    // Changed: add pragmatic fallback for CSV/TXT when clients send octet-stream
+    // Why: Some shells/tools set mimetype to application/octet-stream; we verify by extension then validate content after upload
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (allowedTypes.includes(file.mimetype)) {
+      return cb(null, true);
+    }
+    if (file.mimetype === 'application/octet-stream' && (ext === '.csv' || ext === '.txt')) {
+      return cb(null, true);
+    }
+    return cb(new Error('Unsupported file type'));
+  }
+});
 
 // Feature 2: Processing Queue
 let processingQueue = [];
@@ -340,7 +388,8 @@ router.get('/:fileId', async (req, res) => {
 });
 
 // Upload file (mock)
-router.post('/', async (req, res) => {
+// Changed: Implement real multipart file upload using multer
+router.post('/', uploadMulter.single('file'), async (req, res) => {
   try {
     let currentUser = null;
     
@@ -363,54 +412,54 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'File upload requires multipart/form-data' });
     }
 
-    // MOCK: Simulating file upload processing
-    const mockFile = {
-      originalName: 'uploaded-file.txt',
-      buffer: Buffer.from('mock file content'),
-      mimetype: 'text/plain',
-      size: 17
-    };
+    // Changed: Use actual uploaded file from multer
+    const uploaded = req.file;
+    if (!uploaded) {
+      return res.status(400).json({ error: 'No file provided in multipart/form-data' });
+    }
 
     // BUG: No file validation (fixed: added basic validation)
-    if (mockFile.size === 0) {
+    if (uploaded.size === 0) {
       // Should reject but continues (fixed: by adding return statement)
       console.log('Zero-size file uploaded');
       return res.status(400).json({ error: 'cannot upload empty file' });
     }
 
-    // BUG: No file type validation (fixed: added basic type check)
-    const allowedTypes = ['image/jpeg', 'image/png', 'application/pdf', 'text/csv', 'text/plain'];
-    if (!allowedTypes.includes(mockFile.mimetype)) {
-      console.log('Potentially unsafe file type:', mockFile.mimetype);
+    // Already filtered by multer, but double-check for safety
+    // Changed: allow octet-stream for .csv/.txt as accepted in filter
+    const ext = path.extname(uploaded.originalname).toLowerCase();
+    const isOctetCsvTxt = uploaded.mimetype === 'application/octet-stream' && (ext === '.csv' || ext === '.txt');
+    if (!allowedTypes.includes(uploaded.mimetype) && !isOctetCsvTxt) {
+      console.log('Potentially unsafe file type:', uploaded.mimetype, 'name:', uploaded.originalname);
       return res.status(415).json({ error: 'Unsupported file type' });
     }
 
-    // BUG: No file size limits enforced (fixed: enforces 10MB max)
-    const maxSize = 10 * 1024 * 1024; // 10MB
-    if (mockFile.size > maxSize) {
-      return res.status(413).json({ error: 'File too large' });
+    // Added: Virus scan before accepting the file
+    try {
+      await scanFile(uploaded.path);
+    } catch (scanErr) {
+      // Cleanup infected file
+      try { fs.unlinkSync(uploaded.path); } catch {}
+      return res.status(400).json({ error: scanErr.message });
+    }
+
+    // Added: Content-based validation using magic numbers
+    const validContent = validateByContent(uploaded.path, uploaded.mimetype);
+    if (!validContent) {
+      try { fs.unlinkSync(uploaded.path); } catch {}
+      return res.status(415).json({ error: 'File content does not match declared type' });
     }
 
     // BUG: Predictable filename generation (fixed: using UUIDs)
-    const fileExt = path.extname(mockFile.originalName);
-    const filename = `${uuidv4()}${fileExt}`;
-    const filePath = path.join(UPLOAD_DIR, filename);
-    
-    // NEW: Save file to disk
-    try {
-      fs.writeFileSync(filePath, mockFile.buffer);
-      console.log(`File saved to disk: ${filePath}`);
-    } catch (writeError) {
-      console.error('Failed to save file to disk:', writeError.message);
-      return res.status(500).json({ error: 'Failed to save file' });
-    }
+    const filename = path.basename(uploaded.path);
+    const filePath = uploaded.path;
     
     const newFile = {
       id: uuidv4(),
-      originalName: mockFile.originalName,
+      originalName: uploaded.originalname,
       filename,
-      mimetype: mockFile.mimetype,
-      size: mockFile.size,
+      mimetype: uploaded.mimetype,
+      size: uploaded.size,
       uploadedBy: currentUser.userId, // BUG: Allowing anonymous uploads (fixed: using authenticated user)
       uploadDate: new Date().toISOString(),
       status: 'uploaded',
@@ -421,6 +470,16 @@ router.post('/', async (req, res) => {
     };
 
     uploadedFiles.push(newFile);
+
+    // Added: Generate thumbnail for images
+    if (uploaded.mimetype.startsWith('image/')) {
+      try {
+        const thumbPath = await generateThumbnail(filePath);
+        newFile.thumbnailUrl = `/api/upload/download/${path.basename(thumbPath)}`;
+      } catch (e) {
+        console.log('Thumbnail generation failed:', e.message);
+      }
+    }
 
     // Feature 2: Add to processing queue
     newFile.status = 'queued';
@@ -591,13 +650,30 @@ function processFile(fileId) {
         thumbnailCreated: true
       };
     } else if (file.mimetype === 'text/csv') {
-      // BUG: CSV processing exposes data structure (fixed: removed sensitive column names and preview data)
+      // Changed: Real CSV parsing using csv-parser for basic metrics
+      const csv = require('csv-parser');
+      let rowCount = 0;
+      let firstRow = null;
+      await (async () => {
+        await new Promise((resolve, reject) => {
+          try {
+            fs.createReadStream(file.filePath)
+              .pipe(csv())
+              .on('data', (data) => {
+                rowCount++;
+                if (!firstRow) firstRow = data;
+                // Avoid storing actual data to prevent exposure
+              })
+              .on('end', resolve)
+              .on('error', reject);
+          } catch (e) {
+            reject(e);
+          }
+        });
+      })();
       file.processingResult = {
-        rows: Math.floor(Math.random() * 1000),
-        // columns: ['id', 'name', 'email', 'salary'], // BUG: Exposing column names (fixed: removed)
-        // previewData: [
-        //   { id: 1, name: 'John Doe', email: 'john@company.com', salary: 75000 } // BUG: Exposing actual data (fixed: removed)
-        // ]
+        rows: rowCount,
+        columns: firstRow ? Object.keys(firstRow).length : 0
       };
     } else if (file.mimetype === 'application/pdf') {
       file.processingResult = {
@@ -656,16 +732,37 @@ router.get('/download/:filename', async (req, res) => {
       return res.status(403).json({ error: 'Access denied' });
     }
 
-    // Download the file
+    // Download the file and log access on success
     res.download(filePath, file.originalName, (err) => {
       if (err) {
         console.error('Download error:', err.message);
+      } else {
+        const userId = currentUser ? currentUser.userId : 'anonymous';
+        logAccess(userId, file.id, 'download', req.ip);
       }
     });
   } catch (error) {
     console.error('Download error:', error.message);
     res.status(500).json({ error: 'Download failed' });
   }
+});
+
+// Added: basic in-memory access logs (download events)
+// Why: README calls for access logging of file downloads
+const accessLogs = [];
+function logAccess(userId, fileId, action, ip) {
+  accessLogs.push({ userId, fileId, action, ip, timestamp: new Date().toISOString() });
+}
+
+// Log after successful download via res.download callback above
+// Note: We cannot hook into res.download easily per file; alternatively, expose logs endpoint (admin only)
+router.get('/access-logs', async (req, res) => {
+  let currentUser = null;
+  try { currentUser = getCurrentUser(req); } catch {}
+  if (!currentUser || currentUser.role !== 'admin') {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+  res.json({ logs: accessLogs, count: accessLogs.length });
 });
 
 module.exports = router;

@@ -1,0 +1,62 @@
+How to Test:
+
+Quick Start:
+  npm install
+  npm run dev
+
+Manual Testing:
+
+1. Get a token:
+   TOKEN=$(curl -s -X POST http://localhost:3004/api/auth/token \
+     -H "Content-Type: application/json" \
+     -d '{"userId":"user1","role":"user"}' | \
+     grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+
+2. Upload a file:
+   echo "Test" > test.txt
+   curl -X POST http://localhost:3004/api/upload \
+     -H "Authorization: Bearer $TOKEN" \
+     -F "file=@test.txt"
+
+3. List files:
+   curl http://localhost:3004/api/upload -H "Authorization: Bearer $TOKEN"
+
+4. Test security (should fail):
+   curl http://localhost:3004/api/upload
+   # Should return: {"error":"Authentication required"}
+
+5. Try uploading empty file (should fail):
+   touch empty.txt
+   curl -X POST http://localhost:3004/api/upload \
+     -H "Authorization: Bearer $TOKEN" \
+     -F "file=@empty.txt"
+   # Should return: {"error":"cannot upload empty file"}
+
+Puzzle Solutions:
+
+1. Find hint in headers:
+   curl -I http://localhost:3004/api/upload -H "Authorization: Bearer $TOKEN" | \
+     grep X-Hidden-Metadata
+
+2. Access processing logs:
+   curl "http://localhost:3004/api/processing-logs?access=PROC_LOGS_ADMIN_2024"
+
+3. Get secret with system key:
+   curl -H "X-System-Key: system-processing-key-2024" \
+     "http://localhost:3004/api/processing-logs?level=full"
+
+4. Master archive access:
+   curl -H "X-Archive-Key: ARCHIVE_MASTER_2024" http://localhost:3004/api/archive
+
+Key Files:
+----------
+routes/upload.js - Main upload logic with authentication and validation
+middleware/validator.js - Magic number validation
+middleware/virusScanner.js - Simulated virus scanning
+middleware/rateLimiter.js - Rate limiting
+routes/download.js - Secure downloads
+utils/thumbnails.js - Image thumbnails using Sharp
+routes/processing-logs.js - Puzzle 2 & 3
+routes/archive.js - Puzzle 4
+
+Dependencies used: express, multer, sharp, jsonwebtoken, uuid, csv-parser
