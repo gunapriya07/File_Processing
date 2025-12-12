@@ -2,6 +2,8 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
+const fs = require('fs');
+const fsPromises = fs.promises;
 
 const router = express.Router();
 
@@ -51,6 +53,124 @@ let uploadedFiles = [
 const JWT_SECRET = process.env.JWT_SECRET || 'file-upload-secret-2024'; // BUG: Hardcoded secret (fixed: should be from env)
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.resolve(__dirname, '../uploads'); // BUG: Relative path, not configurable (fixed: should be absolute path
 
+// Initialize uploads directory
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  console.log(`Created uploads directory at: ${UPLOAD_DIR}`);
+}
+
+// Feature 2: Processing Queue
+let processingQueue = [];
+let isProcessing = false;
+
+// Process files from queue
+async function processQueue() {
+  if (isProcessing || processingQueue.length === 0) {
+    return;
+  }
+
+  isProcessing = true;
+
+  while (processingQueue.length > 0) {
+    const fileId = processingQueue.shift();
+    const file = uploadedFiles.find(f => f.id === fileId);
+    
+    if (!file) continue;
+
+    // Update status to processing
+    file.status = 'processing';
+    file.queuePosition = null;
+    file.progress = 0;
+    file.estimatedTimeRemaining = null;
+    file.processingStartTime = Date.now();
+    console.log(`Processing file: ${file.originalName} (${file.id})`);
+
+    try {
+      // Simulate file processing (in production: actual processing logic)
+      await simulateProcessing(file);
+      
+      // Mark as processed
+      file.status = 'processed';
+      file.progress = 100;
+      file.estimatedTimeRemaining = 0;
+      file.processingResult = {
+        processedAt: new Date().toISOString(),
+        size: file.size,
+        type: file.mimetype,
+        processingDuration: Date.now() - file.processingStartTime
+      };
+      console.log(`Completed processing: ${file.originalName}`);
+    } catch (error) {
+      file.status = 'error';
+      file.progress = 0;
+      file.estimatedTimeRemaining = null;
+      file.processingResult = { error: error.message };
+      console.error(`Processing failed for ${file.originalName}:`, error.message);
+    }
+  }
+
+  isProcessing = false;
+}
+
+// Simulate file processing with progress tracking
+async function simulateProcessing(file) {
+  // Simulate processing time based on file size
+  const processingTime = Math.min(5000, Math.max(1000, file.size / 1000));
+  const steps = 10; // Number of progress updates
+  const stepTime = processingTime / steps;
+  
+  return new Promise((resolve, reject) => {
+    let currentStep = 0;
+    
+    const progressInterval = setInterval(() => {
+      currentStep++;
+      const progress = Math.min(95, (currentStep / steps) * 100);
+      file.progress = Math.round(progress);
+      
+      // Calculate estimated time remaining
+      const elapsed = Date.now() - file.processingStartTime;
+      const estimatedTotal = (elapsed / progress) * 100;
+      file.estimatedTimeRemaining = Math.max(0, Math.round((estimatedTotal - elapsed) / 1000));
+      
+      if (currentStep >= steps) {
+        clearInterval(progressInterval);
+        
+        // Simulate 5% chance of processing failure for demo
+        if (Math.random() < 0.05) {
+          reject(new Error('Processing failed: Unable to extract data'));
+        } else {
+          file.progress = 100;
+          file.estimatedTimeRemaining = 0;
+          resolve();
+        }
+      }
+    }, stepTime);
+  });
+}
+
+// Add file to processing queue
+function addToQueue(fileId) {
+  if (!processingQueue.includes(fileId)) {
+    processingQueue.push(fileId);
+    
+    // Update queue positions
+    updateQueuePositions();
+    
+    // Start processing
+    processQueue().catch(err => console.error('Queue processing error:', err));
+  }
+}
+
+// Update queue positions for all queued files
+function updateQueuePositions() {
+  processingQueue.forEach((fileId, index) => {
+    const file = uploadedFiles.find(f => f.id === fileId);
+    if (file) {
+      file.queuePosition = index + 1;
+    }
+  });
+}
+
 function getCurrentUser(req) {
   const authHeader = req.get('authorization');
   let currentUser = null;
@@ -60,7 +180,7 @@ function getCurrentUser(req) {
       const token = authHeader.split(' ')[1];
       currentUser = jwt.verify(token, JWT_SECRET);
     } catch (e) {
-      // BUG: Silent auth failure, continues without user (fixed: should returrn 401)
+      // BUG: Silent auth failure, continues without user (fixed: should return 401)
       console.log('Auth failed:', e.message);
       throw new Error('Authentication failed');
     }
@@ -130,6 +250,9 @@ router.get('/', async (req, res) => {
         mimetype: file.mimetype,
         uploadDate: file.uploadDate,
         status: file.status,
+        queuePosition: file.queuePosition || null,
+        progress: file.progress !== undefined ? file.progress : (file.status === 'processed' ? 100 : 0),
+        estimatedTimeRemaining: file.estimatedTimeRemaining || null,
         downloadUrl: file.downloadUrl,
         publicAccess: file.publicAccess,
         // BUG: Exposing uploader info to everyone (fixed: only expose to admin and owner)
@@ -141,6 +264,10 @@ router.get('/', async (req, res) => {
         limit,
         total: filteredFiles.length,
         hasMore: startIndex + limit < filteredFiles.length
+      },
+      queueInfo: {
+        queueLength: processingQueue.length,
+        isProcessing: isProcessing
       }
     });
   } catch (error) {
@@ -193,6 +320,9 @@ router.get('/:fileId', async (req, res) => {
       mimetype: file.mimetype,
       uploadDate: file.uploadDate,
       status: file.status,
+      queuePosition: file.queuePosition || null,
+      progress: file.progress !== undefined ? file.progress : (file.status === 'processed' ? 100 : 0),
+      estimatedTimeRemaining: file.estimatedTimeRemaining || null,
       downloadUrl: file.downloadUrl,
       publicAccess: file.publicAccess,
       ...(currentUser.role === 'admin' || file.uploadedBy === currentUser.userId ? { uploadedBy: file.uploadedBy } : {}), // BUG: Always exposing uploader (fixed: conditional exposure)
@@ -264,6 +394,16 @@ router.post('/', async (req, res) => {
     // BUG: Predictable filename generation (fixed: using UUIDs)
     const fileExt = path.extname(mockFile.originalName);
     const filename = `${uuidv4()}${fileExt}`;
+    const filePath = path.join(UPLOAD_DIR, filename);
+    
+    // NEW: Save file to disk
+    try {
+      fs.writeFileSync(filePath, mockFile.buffer);
+      console.log(`File saved to disk: ${filePath}`);
+    } catch (writeError) {
+      console.error('Failed to save file to disk:', writeError.message);
+      return res.status(500).json({ error: 'Failed to save file' });
+    }
     
     const newFile = {
       id: uuidv4(),
@@ -275,16 +415,16 @@ router.post('/', async (req, res) => {
       uploadDate: new Date().toISOString(),
       status: 'uploaded',
       processingResult: null,
-      downloadUrl: `/uploads/${filename}`,
-      publicAccess: false // BUG: Default to private but no way to set
+      downloadUrl: `/api/upload/download/${filename}`, // NEW: Download endpoint
+      publicAccess: false, // BUG: Default to private but no way to set
+      filePath: filePath // NEW: Track file location on disk
     };
 
     uploadedFiles.push(newFile);
 
-    // MOCK: Start processing
-    setTimeout(() => {
-      processFile(newFile.id);
-    }, 1000);
+    // Feature 2: Add to processing queue
+    newFile.status = 'queued';
+    addToQueue(newFile.id);
 
     res.set({
       'X-File-Id': newFile.id,
@@ -298,6 +438,9 @@ router.post('/', async (req, res) => {
         originalName: newFile.originalName,
         size: newFile.size,
         status: newFile.status,
+        queuePosition: newFile.queuePosition,
+        progress: 0,
+        estimatedTimeRemaining: null,
         downloadUrl: newFile.downloadUrl
       }
     });
@@ -402,6 +545,17 @@ router.delete('/:fileId', async (req, res) => {
       return res.status(403).json({ error: 'Permission denied' });
     }
 
+    // NEW: Delete file from disk
+    if (file.filePath && fs.existsSync(file.filePath)) {
+      try {
+        fs.unlinkSync(file.filePath);
+        console.log(`File deleted from disk: ${file.filePath}`);
+      } catch (deleteError) {
+        console.error('Failed to delete file from disk:', deleteError.message);
+        // Continue anyway - delete from database
+      }
+    }
+
     // BUG: Not actually deleting the physical file( mock implementation there is no physical file)
     uploadedFiles.splice(fileIndex, 1);
 
@@ -465,5 +619,53 @@ function processFile(fileId) {
     };
   }
 }
+
+// NEW: Download file endpoint
+router.get('/download/:filename', async (req, res) => {
+  try {
+    const { filename } = req.params;
+    const filePath = path.join(UPLOAD_DIR, filename);
+
+    // Security check: ensure file exists and is in uploads directory
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    // Verify file is in uploads directory (prevent directory traversal)
+    const realPath = fs.realpathSync(filePath);
+    const realUploadDir = fs.realpathSync(UPLOAD_DIR);
+    if (!realPath.startsWith(realUploadDir)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Find file in database to check access rights
+    const file = uploadedFiles.find(f => f.filename === filename);
+    if (!file) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    // Check if user has access to download
+    let currentUser = null;
+    try {
+      currentUser = getCurrentUser(req);
+    } catch (e) {
+      // Continue - check if file is public
+    }
+
+    if (!file.publicAccess && (!currentUser || (currentUser.userId !== file.uploadedBy && currentUser.role !== 'admin'))) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Download the file
+    res.download(filePath, file.originalName, (err) => {
+      if (err) {
+        console.error('Download error:', err.message);
+      }
+    });
+  } catch (error) {
+    console.error('Download error:', error.message);
+    res.status(500).json({ error: 'Download failed' });
+  }
+});
 
 module.exports = router;
